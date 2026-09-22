@@ -1,0 +1,4 @@
+# Extra runtime library for --backend whisper on an NVIDIA GPU (Linux).
+# CTranslate2 (used by faster-whisper) loads cuBLAS 12 at runtime; its directory
+# must be on LD_LIBRARY_PATH -- setup_env.sh adds it to .venv/bin/activate.
+nvidia-cublas-cu12

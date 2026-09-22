@@ -1,0 +1,8 @@
+# Python packages for transcribe_recording.py (tested on Python 3.14).
+# System tools, not installable with pip: ffmpeg + ffprobe  (sudo apt install ffmpeg)
+
+# --backend gemini (default); needs GEMINI_API_KEY
+google-genai>=2.24.0,<3
+
+# --backend whisper (local); the model (~3 GB for large-v3) downloads on first use
+faster-whisper>=1.2.1,<2

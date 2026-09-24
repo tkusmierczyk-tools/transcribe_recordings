@@ -1,20 +1,29 @@
 #!/usr/bin/env python3
 """
-Transcribe a FLAC (or any ffmpeg-readable) recording.
+Transcribe a meeting recording (FLAC or any ffmpeg-readable audio).
+
+By default the transcript reads like a conversation: one line per speaker turn,
+e.g. "[00:01:23] S1: ...". Long recordings are sent in overlapping parts and
+speakers are matched on the overlap, so S1 stays the same person throughout;
+a "?" (e.g. "S5?") marks a speaker that could not be linked to an earlier part.
+Parts that could not be transcribed are marked NOT TRANSCRIBED in the output
+and the script exits with status 1.
 
 Backends:
   gemini  - Gemini 3.5 Transcribe via the Interactions API (needs GEMINI_API_KEY)
-  whisper - local faster-whisper (no network; pip install faster-whisper)
+  whisper - local faster-whisper (no network, no speaker labels)
 
 Setup: ./setup_env.sh && source .venv/bin/activate   (needs ffmpeg)
 
 Examples:
-  transcribe.py talk.flac --lang pl-PL
-  transcribe.py meeting.flac --diarize --timestamps
-  transcribe.py lecture.flac --smart --vocab terms.txt
-  transcribe.py interview.flac --backend whisper --lang pl --timestamps
+  transcribe_recording.py meeting.flac                  # speakers + timestamps
+  transcribe_recording.py meeting.flac --lang pl-PL
+  transcribe_recording.py lecture.flac --smart --vocab terms.txt   # clean text, no speakers
+  transcribe_recording.py interview.flac --backend whisper --lang pl
 """
 import argparse
+import collections
+import difflib
 import json
 import re
 import subprocess
@@ -28,6 +37,9 @@ LIMIT_PLAIN = 55 * 60       # documented limit: 60 min per request
 LIMIT_ANNOTATED = 28 * 60   # documented limit: 30 min with diarization / word timestamps
 SILENCE_SEARCH = 120        # seconds to look back from a boundary for a silence
 RETRYABLE = {429, 500, 502, 503, 504}
+MISSING = "NOT TRANSCRIBED"  # marks gaps in the output
+OVERLAP = 120               # seconds each part repeats from the previous one, to match speakers
+MIN_SHARED_WORDS = 3        # words a speaker must say in the overlap to be matched
 
 
 # ---------------------------------------------------------------- utilities
@@ -47,9 +59,10 @@ def duration_s(path):
     return float(out.strip())
 
 
-def normalise(src, dst):
-    """Mono, 16 kHz, lossless FLAC."""
+def normalise(src, dst, loudness=False):
+    """Mono, 16 kHz, lossless FLAC; optionally with evened-out loudness."""
     run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src),
+         *(["-af", "loudnorm"] if loudness else []),
          "-ac", "1", "-ar", "16000", "-c:a", "flac", str(dst)])
 
 
@@ -119,13 +132,52 @@ def offset_s(x):
 
 
 def transcript_text(interaction):
-    """One line per text block (≈ utterance); SDK's output_text glues them with ''."""
+    """Plain transcript text, one segment per line."""
     blocks = [c.text.strip()
               for step in getattr(interaction, "steps", None) or []
               if getattr(step, "type", None) == "model_output"
               for c in getattr(step, "content", None) or []
               if getattr(c, "type", None) == "text" and c.text]
-    return "\n".join(b for b in blocks if b)
+    text = "\n".join(b for b in blocks if b)
+    # segments come back glued together ("had.So, you"): break the line there
+    return re.sub(r"(\w[.?!])(\w)", lambda m: m[1] + "\n" + m[2]
+                  if not m[1][0].isupper() and m[2].isupper() else m[0], text)
+
+
+def link_speakers(prev, new, cut, issued):
+    """Map this part's speaker labels to recording-wide ones ("S1", ...).
+
+    prev: the previous part's words; new: this part's words, which start OVERLAP
+    seconds before `cut`. Both parts transcribed that overlap, so each word they
+    agree on is a vote for "this label is that earlier speaker". Unmatched labels
+    get a new number, with "?" after the first part (may be someone heard before).
+    """
+    key = lambda w: re.sub(r"\W", "", w["text"].lower())
+    a = [w for w in prev if w["start"] is not None and w["start"] >= cut - OVERLAP]
+    b = [w for w in new if w["start"] is not None and w["start"] < cut]
+    votes = collections.Counter()
+    sm = difflib.SequenceMatcher(None, [key(w) for w in a], [key(w) for w in b], autojunk=False)
+    for m in sm.get_matching_blocks():
+        for x, y in zip(a[m.a:m.a + m.size], b[m.b:m.b + m.size]):
+            if x["speaker"] and y["speaker"] and abs(x["start"] - y["start"]) < 2:
+                votes[y["speaker"], x["speaker"]] += 1
+    totals = collections.Counter()
+    for (label, _), n in votes.items():
+        totals[label] += n
+    mapping = {}
+    for (label, known), n in votes.most_common():       # strongest agreement first
+        if (n >= MIN_SHARED_WORDS and n * 2 > totals[label]
+                and label not in mapping and known not in mapping.values()):
+            mapping[label] = known
+    for w in new:                                        # the rest, in order of appearance
+        if w["speaker"] and w["speaker"] not in mapping:
+            issued.append(f"S{len(issued) + 1}" + ("?" if cut else ""))
+            mapping[w["speaker"]] = issued[-1]
+    if cut and mapping:
+        print("  speakers: " + ", ".join(
+            f"{label}->{g}" + (f" ({votes[label, g]} shared words)" if votes[label, g] else "")
+            for label, g in mapping.items()), file=sys.stderr)
+    return mapping
 
 
 def word_annotations(interaction):
@@ -159,9 +211,6 @@ def gemini_request(client, path, tcfg, retries=5):
                 print(f"  API error {code}, retry in {wait}s", file=sys.stderr)
                 time.sleep(wait)
                 continue
-            if it.status != "completed":
-                print(f"  warning: interaction status {it.status!r}, "
-                      "transcript may be truncated", file=sys.stderr)
             return it
     finally:
         client.files.delete(name=f.name)
@@ -173,30 +222,66 @@ def transcribe_gemini(src, args, vocab, workdir):
     tcfg = transcription_config(args, vocab)
     limit = LIMIT_ANNOTATED if (args.diarize or args.timestamps) else LIMIT_PLAIN
 
+    # speakers are matched across parts on repeated audio, which needs word times
+    overlap = OVERLAP if (args.diarize and args.timestamps) else 0
+
     total = duration_s(src)
     silences = silence_midpoints(src) if total > limit else []
-    chunks = plan_chunks(total, limit, silences)
+    chunks = plan_chunks(total, limit - overlap, silences)
 
-    texts, words = [], []
+    texts, words, failures = [], [], []
+    prev, issued = [], []                # previous part's words; speaker names so far
     for i, (start, end) in enumerate(chunks):
         print(f"chunk {i + 1}/{len(chunks)}: {hms(start)}-{hms(end)}", file=sys.stderr)
+        audio_start = max(0.0, start - overlap)   # later parts repeat the previous part's end
         part = src
         if len(chunks) > 1:
             part = workdir / f"chunk_{i:03d}.flac"
-            extract(src, start, end, part)
-        it = gemini_request(client, part, tcfg)
-        texts.append(transcript_text(it))
+            extract(src, audio_start, end, part)
+        try:
+            it = gemini_request(client, part, tcfg)
+        except Exception as e:           # keep the other chunks, mark this one
+            print(f"  failed: {e}", file=sys.stderr)
+            failures.append(e)
+            texts.append(f"[{hms(start)}-{hms(end)} {MISSING}: {e}]")
+            prev = []
+            continue
+        cw = []
         for a in word_annotations(it):
             s = offset_s(getattr(a, "start_offset", None))
             e = offset_s(getattr(a, "end_offset", None))
-            spk = getattr(a, "speaker", None)
-            words.append({
+            cw.append({
                 "text": a.text,
-                # labels are only consistent within a single request
-                "speaker": f"c{i}:{spk}" if (spk and len(chunks) > 1) else spk,
-                "start": None if s is None else round(s + start, 3),
-                "end": None if e is None else round(e + start, 3),
+                "speaker": getattr(a, "speaker", None),
+                "start": None if s is None else round(s + audio_start, 3),
+                "end": None if e is None else round(e + audio_start, 3),
             })
+        # raw labels only hold within one request: map them to recording-wide ones
+        mapping = link_speakers(prev, cw, start, issued)
+        for w in cw:
+            w["speaker"] = mapping.get(w["speaker"])
+        # drop the repeated overlap: the leading words up to the first run clearly past
+        # the cut (by position, so a later word with a garbled timestamp is kept)
+        past = lambda w: w["start"] is None or w["start"] >= start
+        j = next((k for k in range(len(cw)) if all(map(past, cw[k:k + 3]))), len(cw))
+        own = cw[j:]
+        words += own
+        prev = own
+        plain = transcript_text(it)
+        # speaker turns read like a conversation; use them only if they cover the text
+        if any(w["speaker"] for w in own) and len(cw) >= 0.9 * len(plain.split()):
+            texts.append(turns(own))
+        else:
+            if args.diarize:
+                print("  note: speaker data incomplete, using plain text for this part",
+                      file=sys.stderr)
+            texts.append(plain)
+        if it.status != "completed":     # e.g. output limit hit: the end may be missing
+            print(f"  warning: response status {it.status!r}", file=sys.stderr)
+            texts.append(f"[{hms(start)}-{hms(end)} {MISSING}? "
+                         f"response status {it.status!r}, the end of this part may be cut off]")
+    if len(failures) == len(chunks):     # nothing worth saving
+        raise failures[-1]
     return "\n\n".join(texts), words
 
 
@@ -204,6 +289,7 @@ def transcribe_gemini(src, args, vocab, workdir):
 
 def transcribe_whisper(src, args, vocab):
     from faster_whisper import WhisperModel
+    print(f"loading whisper model {args.whisper_model} (downloaded on first use)", file=sys.stderr)
     model = WhisperModel(args.whisper_model, device="auto", compute_type="default")
     segments, info = model.transcribe(
         str(src),
@@ -234,20 +320,29 @@ def main():
     p.add_argument("-o", "--output", help="output stem (default: input without extension)")
     p.add_argument("--backend", choices=["gemini", "whisper"], default="gemini")
     p.add_argument("--lang", help="e.g. pl-PL; omit for auto-detection")
-    p.add_argument("--diarize", action="store_true", help="speaker labels (gemini)")
-    p.add_argument("--timestamps", action="store_true", help="word-level timestamps")
-    p.add_argument("--smart", action="store_true", help="gemini smart mode (clean, formatted)")
+    p.add_argument("--diarize", action=argparse.BooleanOptionalAction,
+                   help="speaker labels (gemini; on by default)")
+    p.add_argument("--timestamps", action=argparse.BooleanOptionalAction,
+                   help="timestamps (on by default)")
+    p.add_argument("--smart", action="store_true",
+                   help="gemini smart mode: clean, formatted text without speakers")
     p.add_argument("--vocab", type=Path, help="file with one term per line")
     p.add_argument("--whisper-model", default="large-v3")
     args = p.parse_args()
 
-    annotated = args.diarize or args.timestamps
-    if args.smart and annotated:
-        p.error("--smart cannot be combined with --diarize/--timestamps")
-    if args.backend == "gemini" and args.vocab and annotated:
-        p.error("--vocab cannot be combined with --diarize/--timestamps on gemini")
     if args.backend == "whisper" and (args.diarize or args.smart):
         p.error("--diarize/--smart are gemini-only (for local diarization see WhisperX)")
+    # Gemini can't combine --smart/--vocab with speaker labels or timestamps
+    plain_only = args.backend == "gemini" and bool(args.smart or args.vocab)
+    if plain_only and (args.diarize or args.timestamps):
+        p.error("--smart/--vocab cannot be combined with --diarize/--timestamps on gemini")
+    if plain_only:
+        print("note: --smart/--vocab turn off speaker labels and timestamps", file=sys.stderr)
+    # meeting defaults: speakers and timestamps unless turned off or ruled out
+    if args.diarize is None:
+        args.diarize = args.backend == "gemini" and not plain_only
+    if args.timestamps is None:
+        args.timestamps = not plain_only
 
     vocab = []
     if args.vocab:
@@ -257,7 +352,8 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         workdir = Path(tmp)
         norm = workdir / "normalised.flac"
-        normalise(args.input, norm)
+        # whisper's voice detection skips quiet speech; evening out loudness prevents that
+        normalise(args.input, norm, loudness=args.backend == "whisper")
         if args.backend == "gemini":
             text, words = transcribe_gemini(norm, args, vocab, workdir)
         else:
@@ -267,9 +363,9 @@ def main():
     if words:
         Path(f"{stem}.words.json").write_text(
             json.dumps(words, ensure_ascii=False, indent=1), encoding="utf-8")
-        if args.diarize:
-            Path(f"{stem}.turns.txt").write_text(turns(words) + "\n", encoding="utf-8")
     print(f"done: {stem}.txt", file=sys.stderr)
+    if MISSING in text:
+        sys.exit(f"warning: some parts were not transcribed, see '{MISSING}' in {stem}.txt")
 
 
 if __name__ == "__main__":

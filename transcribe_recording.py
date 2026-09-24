@@ -3,10 +3,10 @@
 Transcribe a meeting recording (FLAC or any ffmpeg-readable audio).
 
 By default the transcript reads like a conversation: one line per speaker turn,
-e.g. "[00:01:23] Speaker1: ...". Long recordings are sent in overlapping parts and
-speakers are matched on the overlap, so Speaker1 stays the same person throughout;
-a "?" (e.g. "Speaker5?") marks a speaker who may be someone heard earlier, and the
-transcript notes who ("[Speaker5? may be Speaker1 or Speaker3 ...]").
+e.g. "[00:01:23] [Speaker1]: ...". Long recordings are sent in overlapping parts
+and speakers are matched on the overlap, so Speaker1 stays the same person
+throughout. A speaker who may be someone heard earlier is shown with the
+candidates, e.g. "[Speaker5 (Speaker1?, Speaker3?)]".
 Parts that could not be transcribed are marked NOT TRANSCRIBED in the output
 and the script exits with status 1.
 
@@ -118,17 +118,24 @@ def extract(src, start, end, dst):
          "-c:a", "flac", str(dst)])
 
 
-def turns(words):
-    """Group consecutive words by speaker label."""
+def turns(words, doubts=None):
+    """Group consecutive words by speaker label.
+
+    doubts: label -> earlier speakers it may be, shown as "[Speaker5 (Speaker2?)]".
+    """
     out, cur = [], None
     for w in words:
         if cur is None or w["speaker"] != cur["speaker"]:
             cur = {"speaker": w["speaker"], "start": w["start"], "words": []}
             out.append(cur)
         cur["words"].append(w["text"])
+
+    def name(s):
+        maybe = (doubts or {}).get(s)
+        return f"[{s} ({', '.join(m + '?' for m in maybe)})]" if maybe else f"[{s or '-'}]"
     # without --timestamps there are no offsets, so omit the time prefix
     return "\n".join(("" if t["start"] is None else f"[{hms(t['start'])}] ")
-                     + f"{t['speaker'] or '-'}: {' '.join(t['words'])}"
+                     + f"{name(t['speaker'])}: {' '.join(t['words'])}"
                      for t in out)
 
 
@@ -175,8 +182,8 @@ def link_speakers(prev, new, audio_start, cut, issued):
     prev: the previous part's words; new: this part's words, which start at
     audio_start, before `cut`. Both parts transcribed that overlap, so each word
     they agree on is a vote for "this label is that earlier speaker". Unmatched
-    labels get a new number, with "?" if they may be an earlier speaker not heard
-    in this part. Returns the mapping and notes on who each "?" may be.
+    labels get a new number. issued (label -> earlier speakers it may be, empty
+    if certain) is updated here. Returns the mapping.
     """
     key = lambda w: re.sub(r"\W", "", w["text"].lower())
     a = [w for w in prev if w["start"] is not None and w["start"] >= audio_start]
@@ -190,27 +197,32 @@ def link_speakers(prev, new, audio_start, cut, issued):
     totals = collections.Counter()
     for (label, _), n in votes.items():
         totals[label] += n
-    mapping, notes, earlier = {}, [], list(issued)
+    mapping, earlier = {}, list(issued)
+    # labels that speak in this part's own time, after the overlap
+    speaking = {w["speaker"] for w in new if w["start"] is None or w["start"] >= cut}
     for (label, known), n in votes.most_common():       # strongest agreement first
         if (n >= MIN_SHARED_WORDS and n * 2 > totals[label]
                 and label not in mapping and known not in mapping.values()):
             mapping[label] = known
     for w in new:                                        # the rest, in order of appearance
         if w["speaker"] and w["speaker"] not in mapping:
-            # a new person, unless an earlier speaker is still unaccounted for
-            maybe = [s for s in earlier if s not in mapping.values()]
-            issued.append(f"Speaker{len(issued) + 1}" + ("?" if maybe else ""))
-            mapping[w["speaker"]] = issued[-1]
-            if maybe:
-                notes.append(f"{issued[-1]} may be {' or '.join(maybe)}"
-                             " (not heard in the overlap with the previous part)")
+            # a new person, unless an earlier speaker is still unaccounted for; a label
+            # heard only in the overlap doesn't count (Gemini may relabel them later)
+            accounted = {g for raw, g in mapping.items() if raw in speaking}
+            name = f"Speaker{len(issued) + 1}"
+            issued[name] = [s for s in earlier if s not in accounted]
+            mapping[w["speaker"]] = name
     if mapping:
         log("  speakers: " + ", ".join(
-            f"{label}->{g}" + (f" ({votes[label, g]} shared words)" if votes[label, g] else "")
-            for label, g in mapping.items()))
-        for note in notes:
-            log(f"  {note}")
-    return mapping, notes
+            f"{raw}->{g}" + (f" ({votes[raw, g]} shared words"
+                             + ("" if raw in speaking else ", only in the overlap") + ")"
+                             if votes[raw, g] else "")
+            for raw, g in mapping.items()))
+        for g in mapping.values():
+            if g not in earlier and issued[g]:
+                log(f"  {g} may be {' or '.join(issued[g])} "
+                    "(not heard in the overlap with the previous part)")
+    return mapping
 
 
 def word_annotations(interaction):
@@ -278,7 +290,7 @@ def transcribe_gemini(src, args, vocab, workdir):
         log("the recording fits in one request")
 
     texts, words, failures = [], [], []
-    prev, issued = [], []                # previous part's words; speaker names so far
+    prev, issued = [], {}                # previous part's words; speakers so far -> doubts
     start, parts = 0.0, 0
     while start < total:                 # each part is planned once the previous one is done
         # later parts start early, repeating the previous part's end to match speakers
@@ -314,9 +326,11 @@ def transcribe_gemini(src, args, vocab, workdir):
         log(f"  got {len(plain.split())} words of text, {len(cw)} with per-word details"
             + (f", {len({w['speaker'] for w in cw} - {None})} speakers" if args.diarize else ""))
         # raw labels only hold within one request: map them to recording-wide ones
-        mapping, notes = link_speakers(prev, cw, audio_start, start, issued)
+        mapping = link_speakers(prev, cw, audio_start, start, issued)
         for w in cw:
             w["speaker"] = mapping.get(w["speaker"])
+            if issued.get(w["speaker"]):
+                w["maybe"] = issued[w["speaker"]]       # earlier speakers this may be
         # drop the repeated overlap: the leading words up to the first run clearly past
         # the cut (by position, so a later word with a garbled timestamp is kept)
         past = lambda w: w["start"] is None or w["start"] >= start
@@ -326,14 +340,13 @@ def transcribe_gemini(src, args, vocab, workdir):
             log(f"  dropping the first {j} words: the previous part already has them")
         words += own
         prev = own
-        head = "".join(f"[{note}]\n" for note in notes)
         # speaker turns read like a conversation; use them only if they cover the text
         if any(w["speaker"] for w in own) and len(cw) >= 0.9 * len(plain.split()):
-            texts.append(head + turns(own))
+            texts.append(turns(own, issued))
         else:
             if args.diarize:
                 log("  note: speaker data incomplete, using plain text for this part")
-            texts.append(head + plain)
+            texts.append(plain)
         if it.status != "completed":     # e.g. output limit hit: the end may be missing
             log(f"  warning: response status {it.status!r}, the end of this part may be missing")
             texts.append(f"[{hms(start)}-{hms(end)} {MISSING}? "

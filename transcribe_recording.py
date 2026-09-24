@@ -3,10 +3,10 @@
 Transcribe a meeting recording (FLAC or any ffmpeg-readable audio).
 
 By default the transcript reads like a conversation: one line per speaker turn,
-e.g. "[00:01:23] S1: ...". Long recordings are sent in overlapping parts and
-speakers are matched on the overlap, so S1 stays the same person throughout;
-a "?" (e.g. "S5?") marks a speaker who may be someone heard earlier, and the
-transcript notes who ("[S5? may be S1 or S3 ...]").
+e.g. "[00:01:23] Speaker1: ...". Long recordings are sent in overlapping parts and
+speakers are matched on the overlap, so Speaker1 stays the same person throughout;
+a "?" (e.g. "Speaker5?") marks a speaker who may be someone heard earlier, and the
+transcript notes who ("[Speaker5? may be Speaker1 or Speaker3 ...]").
 Parts that could not be transcribed are marked NOT TRANSCRIBED in the output
 and the script exits with status 1.
 
@@ -157,7 +157,7 @@ def transcript_text(interaction):
 
 
 def link_speakers(prev, new, audio_start, cut, issued):
-    """Map this part's speaker labels to recording-wide ones ("S1", ...).
+    """Map this part's speaker labels to recording-wide ones ("Speaker1", ...).
 
     prev: the previous part's words; new: this part's words, which start at
     audio_start, before `cut`. Both parts transcribed that overlap, so each word
@@ -186,7 +186,7 @@ def link_speakers(prev, new, audio_start, cut, issued):
         if w["speaker"] and w["speaker"] not in mapping:
             # a new person, unless an earlier speaker is still unaccounted for
             maybe = [s for s in earlier if s not in mapping.values()]
-            issued.append(f"S{len(issued) + 1}" + ("?" if maybe else ""))
+            issued.append(f"Speaker{len(issued) + 1}" + ("?" if maybe else ""))
             mapping[w["speaker"]] = issued[-1]
             if maybe:
                 notes.append(f"{issued[-1]} may be {' or '.join(maybe)}"

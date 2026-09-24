@@ -5,7 +5,8 @@ Transcribe a meeting recording (FLAC or any ffmpeg-readable audio).
 By default the transcript reads like a conversation: one line per speaker turn,
 e.g. "[00:01:23] S1: ...". Long recordings are sent in overlapping parts and
 speakers are matched on the overlap, so S1 stays the same person throughout;
-a "?" (e.g. "S5?") marks a speaker that could not be linked to an earlier part.
+a "?" (e.g. "S5?") marks a speaker who may be someone heard earlier, and the
+transcript notes who ("[S5? may be S1 or S3 ...]").
 Parts that could not be transcribed are marked NOT TRANSCRIBED in the output
 and the script exits with status 1.
 
@@ -38,7 +39,9 @@ LIMIT_ANNOTATED = 28 * 60   # documented limit: 30 min with diarization / word t
 SILENCE_SEARCH = 120        # seconds to look back from a boundary for a silence
 RETRYABLE = {429, 500, 502, 503, 504}
 MISSING = "NOT TRANSCRIBED"  # marks gaps in the output
-OVERLAP = 120               # seconds each part repeats from the previous one, to match speakers
+MIN_OVERLAP = 120           # seconds each part repeats from the previous one, to match speakers;
+MAX_OVERLAP = 600           # extended up to this so each recent speaker is heard again
+WORDS_TO_HEAR = 10          # words of each recent speaker the overlap should contain
 MIN_SHARED_WORDS = 3        # words a speaker must say in the overlap to be matched
 
 
@@ -76,15 +79,24 @@ def silence_midpoints(path, noise_db=-35, min_dur=0.4):
     return [(s + e) / 2 for s, e in zip(starts, ends)]
 
 
-def plan_chunks(total, limit, silences):
-    """[(start, end), ...], cutting at the latest silence before each limit."""
-    cuts = [0.0]
-    while total - cuts[-1] > limit:
-        target = cuts[-1] + limit
-        near = [s for s in silences if target - SILENCE_SEARCH <= s <= target]
-        cuts.append(max(near) if near else target)   # hard cut as fallback
-    cuts.append(total)
-    return list(zip(cuts[:-1], cuts[1:]))
+def next_cut(total, target, silences):
+    """End of a part that may run until `target`: the latest silence before it."""
+    if target >= total:
+        return total
+    near = [s for s in silences if target - SILENCE_SEARCH <= s <= target]
+    return max(near) if near else target          # hard cut as fallback
+
+
+def overlap_start(prev, cut):
+    """Where the part after `cut` should start: early enough that everyone who spoke
+    in the last MAX_OVERLAP seconds says WORDS_TO_HEAR words again, and at least
+    MIN_OVERLAP back."""
+    heard = collections.defaultdict(list)
+    for w in prev:
+        if w["speaker"] and w["start"] is not None and cut - MAX_OVERLAP <= w["start"] < cut:
+            heard[w["speaker"]].append(w["start"])
+    need = [sorted(t)[-WORDS_TO_HEAR:][0] for t in heard.values()]
+    return max(0.0, min([cut - MIN_OVERLAP, *need]))
 
 
 def extract(src, start, end, dst):
@@ -144,16 +156,17 @@ def transcript_text(interaction):
                   if not m[1][0].isupper() and m[2].isupper() else m[0], text)
 
 
-def link_speakers(prev, new, cut, issued):
+def link_speakers(prev, new, audio_start, cut, issued):
     """Map this part's speaker labels to recording-wide ones ("S1", ...).
 
-    prev: the previous part's words; new: this part's words, which start OVERLAP
-    seconds before `cut`. Both parts transcribed that overlap, so each word they
-    agree on is a vote for "this label is that earlier speaker". Unmatched labels
-    get a new number, with "?" after the first part (may be someone heard before).
+    prev: the previous part's words; new: this part's words, which start at
+    audio_start, before `cut`. Both parts transcribed that overlap, so each word
+    they agree on is a vote for "this label is that earlier speaker". Unmatched
+    labels get a new number, with "?" if they may be an earlier speaker not heard
+    in this part. Returns the mapping and notes on who each "?" may be.
     """
     key = lambda w: re.sub(r"\W", "", w["text"].lower())
-    a = [w for w in prev if w["start"] is not None and w["start"] >= cut - OVERLAP]
+    a = [w for w in prev if w["start"] is not None and w["start"] >= audio_start]
     b = [w for w in new if w["start"] is not None and w["start"] < cut]
     votes = collections.Counter()
     sm = difflib.SequenceMatcher(None, [key(w) for w in a], [key(w) for w in b], autojunk=False)
@@ -164,20 +177,27 @@ def link_speakers(prev, new, cut, issued):
     totals = collections.Counter()
     for (label, _), n in votes.items():
         totals[label] += n
-    mapping = {}
+    mapping, notes, earlier = {}, [], list(issued)
     for (label, known), n in votes.most_common():       # strongest agreement first
         if (n >= MIN_SHARED_WORDS and n * 2 > totals[label]
                 and label not in mapping and known not in mapping.values()):
             mapping[label] = known
     for w in new:                                        # the rest, in order of appearance
         if w["speaker"] and w["speaker"] not in mapping:
-            issued.append(f"S{len(issued) + 1}" + ("?" if cut else ""))
+            # a new person, unless an earlier speaker is still unaccounted for
+            maybe = [s for s in earlier if s not in mapping.values()]
+            issued.append(f"S{len(issued) + 1}" + ("?" if maybe else ""))
             mapping[w["speaker"]] = issued[-1]
+            if maybe:
+                notes.append(f"{issued[-1]} may be {' or '.join(maybe)}"
+                             " (not heard in the overlap with the previous part)")
     if cut and mapping:
         print("  speakers: " + ", ".join(
             f"{label}->{g}" + (f" ({votes[label, g]} shared words)" if votes[label, g] else "")
             for label, g in mapping.items()), file=sys.stderr)
-    return mapping
+        for note in notes:
+            print(f"  {note}", file=sys.stderr)
+    return mapping, notes
 
 
 def word_annotations(interaction):
@@ -223,28 +243,33 @@ def transcribe_gemini(src, args, vocab, workdir):
     limit = LIMIT_ANNOTATED if (args.diarize or args.timestamps) else LIMIT_PLAIN
 
     # speakers are matched across parts on repeated audio, which needs word times
-    overlap = OVERLAP if (args.diarize and args.timestamps) else 0
+    match = args.diarize and args.timestamps
 
     total = duration_s(src)
     silences = silence_midpoints(src) if total > limit else []
-    chunks = plan_chunks(total, limit - overlap, silences)
 
     texts, words, failures = [], [], []
     prev, issued = [], []                # previous part's words; speaker names so far
-    for i, (start, end) in enumerate(chunks):
-        print(f"chunk {i + 1}/{len(chunks)}: {hms(start)}-{hms(end)}", file=sys.stderr)
-        audio_start = max(0.0, start - overlap)   # later parts repeat the previous part's end
+    start, parts = 0.0, 0
+    while start < total:                 # each part is planned once the previous one is done
+        # later parts start early, repeating the previous part's end to match speakers
+        audio_start = overlap_start(prev, start) if (match and start) else start
+        end = next_cut(total, audio_start + limit, silences)
+        parts += 1
+        print(f"part {parts}: {hms(start)}-{hms(end)}" + (
+            f" (from {hms(audio_start)} to match speakers)" if audio_start < start else ""),
+            file=sys.stderr)
         part = src
-        if len(chunks) > 1:
-            part = workdir / f"chunk_{i:03d}.flac"
+        if (audio_start, end) != (0.0, total):
+            part = workdir / f"part_{parts:03d}.flac"
             extract(src, audio_start, end, part)
         try:
             it = gemini_request(client, part, tcfg)
-        except Exception as e:           # keep the other chunks, mark this one
+        except Exception as e:           # keep the other parts, mark this one
             print(f"  failed: {e}", file=sys.stderr)
             failures.append(e)
             texts.append(f"[{hms(start)}-{hms(end)} {MISSING}: {e}]")
-            prev = []
+            prev, start = [], end
             continue
         cw = []
         for a in word_annotations(it):
@@ -257,7 +282,7 @@ def transcribe_gemini(src, args, vocab, workdir):
                 "end": None if e is None else round(e + audio_start, 3),
             })
         # raw labels only hold within one request: map them to recording-wide ones
-        mapping = link_speakers(prev, cw, start, issued)
+        mapping, notes = link_speakers(prev, cw, audio_start, start, issued)
         for w in cw:
             w["speaker"] = mapping.get(w["speaker"])
         # drop the repeated overlap: the leading words up to the first run clearly past
@@ -268,19 +293,21 @@ def transcribe_gemini(src, args, vocab, workdir):
         words += own
         prev = own
         plain = transcript_text(it)
+        head = "".join(f"[{note}]\n" for note in notes)
         # speaker turns read like a conversation; use them only if they cover the text
         if any(w["speaker"] for w in own) and len(cw) >= 0.9 * len(plain.split()):
-            texts.append(turns(own))
+            texts.append(head + turns(own))
         else:
             if args.diarize:
                 print("  note: speaker data incomplete, using plain text for this part",
                       file=sys.stderr)
-            texts.append(plain)
+            texts.append(head + plain)
         if it.status != "completed":     # e.g. output limit hit: the end may be missing
             print(f"  warning: response status {it.status!r}", file=sys.stderr)
             texts.append(f"[{hms(start)}-{hms(end)} {MISSING}? "
                          f"response status {it.status!r}, the end of this part may be cut off]")
-    if len(failures) == len(chunks):     # nothing worth saving
+        start = end
+    if len(failures) == parts:           # nothing worth saving
         raise failures[-1]
     return "\n\n".join(texts), words
 

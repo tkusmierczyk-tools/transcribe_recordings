@@ -365,18 +365,20 @@ def transcribe_whisper(src, args, vocab):
     log(f"loading whisper model {args.whisper_model} (downloaded on first use)")
     model = WhisperModel(args.whisper_model, device="auto", compute_type="default")
     log(f"  model loaded, running on {model.model.device}")
-    log("finding the parts with speech" + ("" if args.lang else " and detecting the language"))
+    if not args.lang:
+        log("detecting the language")
     segments, info = model.transcribe(
         str(src),
         language=args.lang.split("-")[0] if args.lang else None,  # ISO 639-1
-        vad_filter=True,                   # skip non-speech regions
+        # no voice-activity filter: on meeting recordings it skipped over half the speech
+        vad_filter=False,
         condition_on_previous_text=False,  # limits repetition loops on long audio
         word_timestamps=args.timestamps,
         initial_prompt=", ".join(vocab) if vocab else None,
         beam_size=5,
     )
     log(f"  language: {info.language} (p={info.language_probability:.2f}); "
-        f"{hms(info.duration_after_vad)} of speech in {hms(info.duration)} of audio")
+        f"{hms(info.duration)} of audio")
     log("transcribing")
     lines, words, report = [], [], 300
     for seg in segments:                   # decoding happens lazily here
@@ -439,7 +441,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         workdir = Path(tmp)
         norm = workdir / "normalised.flac"
-        # whisper's voice detection skips quiet speech; evening out loudness prevents that
+        # evening out loudness helps whisper with quiet speakers
         log("converting the audio to 16 kHz mono FLAC"
             + (", evening out loudness" if args.backend == "whisper" else ""))
         normalise(args.input, norm, loudness=args.backend == "whisper")
